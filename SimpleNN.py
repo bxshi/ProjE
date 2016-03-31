@@ -10,7 +10,8 @@ logging = tf.logging
 
 flags.DEFINE_string("dataset", 'fb15k', "Dataset, [fb15k|wn18]")
 flags.DEFINE_boolean("simple", True, "Use simple projection (weighted plus) or matrix projection.")
-flags.DEFINE_integer("topk", 1, "Hits@topk, default 1.")
+flags.DEFINE_integer("topk", 1, "relation Hits@topk, default 1.")
+flags.DEFINE_integer("ent_topk", 10, "entity Hits@topk, default 10.")
 flags.DEFINE_integer("batch", 500, "mini batch size, default 2500.")
 flags.DEFINE_integer('embed', 100, "embedding size, default 100.")
 flags.DEFINE_integer('max_iter', 1000, 'max iteration, default 1000.')
@@ -256,28 +257,67 @@ def gen_targets(inputs, n_rel, raw_data, rule_map):
 
 
 def gen_filtered_rels(raw_data):
-    """ Generate [[all rels], ...] w.r.t. generated inputs, i-th element contains all the relations
-    connect i-th entity pair in inputs.
+    """ Generate [[all rels], ...] w.r.t. generated test inputs, i-th element contains all the relations
+    connect i-th entity pair in test inputs.
     """
     filtered_rels = []
-    max_edges = 0
+    max_rel_offset = 0
     for p in raw_data.test['path']:
         head, tail, rel = p
         filtered_rel = set()
         try:
             for r in raw_data.test['adj'][head][tail]:
                 filtered_rel.add(r)
+        except KeyError:
+            pass
+        try:
             for r in raw_data.train['adj'][head][tail]:
                 filtered_rel.add(r)
+        except KeyError:
+            pass
+        try:
             for r in raw_data.valid['adj'][head][tail]:
                 filtered_rel.add(r)
         except KeyError:
             pass
-        max_edges = max(max_edges, len(filtered_rel))
+        max_rel_offset = max(max_rel_offset, len(filtered_rel))
         filtered_rels.append(filtered_rel)
 
-    print "max_n_edges", max_edges
-    return np.asarray(filtered_rels)
+    print "max rel offset", max_rel_offset
+    return np.asarray(filtered_rels), max_rel_offset
+
+
+def gen_filtered_tails(raw_data):
+    """ Generate [[all tails], ] w.r.t generated test inputs, i-th element contains all the tails
+    connect i-th head and rel in test inputs.
+    """
+
+    filtered_tails = []
+    max_tail_offset = 0
+    for p in raw_data.test['path']:
+        head, tail, rel = p
+        filtered_tail = set()
+        try:
+            for tail in raw_data.hl_test_map[head][rel]:
+                filtered_tail.add(tail)
+        except KeyError:
+            pass
+        try:
+            for tail in raw_data.hlmap[head][rel]:
+                filtered_tail.add(tail)
+        except KeyError:
+            pass
+        try:
+            for tail in raw_data.hl_valid_map[head][rel]:
+                filtered_tail.add(tail)
+        except KeyError:
+            pass
+
+        max_tail_offset = max(max_tail_offset, len(filtered_tail))
+        filtered_tails.append(filtered_tail)
+
+    print "max tail offset", max_tail_offset
+    return np.asarray(filtered_tails), max_tail_offset
 
 
 def run(raw_data):
@@ -303,7 +343,44 @@ def run(raw_data):
     return model, ph_input, ph_target, loss, op_train, op_test
 
 
-def run_eval(session, ph_input, op_test, raw_data, filtered_rels, k=1):
+def run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails, k=10, max_offset=10):
+    total = 0
+    raw_hits = 0
+    filtered_hits = 0
+
+    inputs = np.zeros([raw_data.entity_id_max + 1, 2], dtype=np.int32)
+
+    inputs[:, 1] = range(0, raw_data.entity_id_max + 1)  # put all tail candidates into inputs
+
+    test_data = raw_data.test['path']
+
+    with tf.device("/cpu:0"):
+        ph_rel = tf.placeholder(tf.int32, shape=[1])
+        op_entity_test = tf.reshape(tf.nn.embedding_lookup(tf.transpose(op_test), ph_rel), [1, raw_data.entity_id_max + 1])
+
+    for (i, path) in enumerate(test_data):
+        head, tail, rel = path
+        inputs[:, 0] = head
+
+        _, op_top_tails = tf.nn.top_k(op_entity_test, len(filtered_tails[i]) + k)
+        top_tails = session.run(op_top_tails, {ph_input: inputs, ph_rel: [rel]})[0]
+
+        total += 1
+        idx = 0
+        filtered_idx = 0
+        while filtered_idx < k and idx < len(top_tails):
+            if top_tails[idx] == tail:
+                filtered_hits += 1
+                break
+            elif top_tails[idx] not in filtered_tails[i]:
+                filtered_idx += 1
+            idx += 1
+        raw_hits += tail in top_tails[:k]
+
+    return float(raw_hits) / float(total), float(filtered_hits) / float(total)
+
+
+def run_relation_eval(session, ph_input, op_test, raw_data, filtered_rels, k=1, max_offset=11):
     """ Executes evaluation and returns accuracy score.
     """
     total = 0
@@ -314,7 +391,7 @@ def run_eval(session, ph_input, op_test, raw_data, filtered_rels, k=1):
     targets = raw_data.test['path'][:, 2]
 
     with tf.device("/cpu:0"):
-        _, top_rels = tf.nn.top_k(op_test, 20 * k)
+        _, top_rels = tf.nn.top_k(op_test, max_offset + k)
         top_rels = session.run(top_rels, {ph_input: inputs})
 
     for i in range(len(top_rels)):
@@ -348,7 +425,8 @@ def main(_):
     inputs = gen_inputs(raw_data)
     rule_map = load_amie_rules(raw_data)
     targets = gen_targets(inputs, raw_data.rel_id_max + 1, raw_data, rule_map)
-    filtered_rels = gen_filtered_rels(raw_data)
+    filtered_rels, max_rel_offset = gen_filtered_rels(raw_data)
+    filtered_tails, max_ent_offset = gen_filtered_tails(raw_data)
 
     best_raw_acc = 0.
     best_raw_iter = -1
@@ -384,20 +462,29 @@ def main(_):
 
             print "\n\tloss:", accu_loss, "cost:", timeit.default_timer() - start_time, "seconds.\n"
 
-            raw_acc, filtered_acc = run_eval(session, ph_input, op_test, raw_data, filtered_rels, k=FLAGS.topk)
+            print "--- relation prediction ---"
 
-            print "\n\traw", raw_acc, "\t\tfiltered", filtered_acc, "\n"
+            raw_rel_acc, filtered_rel_acc = run_relation_eval(session, ph_input, op_test, raw_data, filtered_rels, k=FLAGS.topk,
+                                                      max_offset=max_rel_offset)
 
-            if raw_acc > best_raw_acc:
-                best_raw_acc = raw_acc
+            print "\n\traw", raw_rel_acc, "\t\tfiltered", filtered_rel_acc, "\n"
+
+            if raw_rel_acc > best_raw_acc:
+                best_raw_acc = raw_rel_acc
                 best_raw_iter = it
 
-            if filtered_acc > best_filtered_acc:
-                best_filtered_acc = filtered_acc
+            if filtered_rel_acc > best_filtered_acc:
+                best_filtered_acc = filtered_rel_acc
                 best_filtered_iter = it
 
             print "\tbest\n\traw", best_raw_acc, "(", best_raw_iter, ")", \
                 "\tfiltered", best_filtered_acc, "(", best_filtered_iter, ")\n"
+
+            print "--- entity (tail) prediction ---"
+
+            raw_ent_acc, filtered_ent_acc = run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails, k=FLAGS.ent_topk, max_offset=max_ent_offset)
+
+            print "\n\traw", raw_ent_acc, "\t\tfiltered", filtered_ent_acc, "\n"
 
             print "--------------------------"
 

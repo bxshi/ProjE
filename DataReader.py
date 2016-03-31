@@ -198,6 +198,7 @@ class MetaPathData(Data):
 
         self._hlmap, self._tlmap = Data.gen_lmap(self._train['path'])
         self._hl_test_map, self._tl_test_map = Data.gen_lmap(self._test['path'])
+        self.hl_valid_map, self.tl_valid_map = Data.gen_lmap(self._valid['path'])
 
     @property
     def entity2id(self):
