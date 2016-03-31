@@ -9,9 +9,9 @@ flags = tf.flags
 logging = tf.logging
 
 flags.DEFINE_string("dataset", 'fb15k', "Dataset, [fb15k|wn18]")
-flags.DEFINE_boolean("simple", False, "Use simple projection (weighted plus) or matrix projection.")
+flags.DEFINE_boolean("simple", True, "Use simple projection (weighted plus) or matrix projection.")
 flags.DEFINE_integer("topk", 1, "Hits@topk, default 1.")
-flags.DEFINE_integer("batch", 2500, "mini batch size, default 2500.")
+flags.DEFINE_integer("batch", 500, "mini batch size, default 2500.")
 flags.DEFINE_integer('embed', 100, "embedding size, default 100.")
 flags.DEFINE_integer('max_iter', 1000, 'max iteration, default 1000.')
 flags.DEFINE_string("load", "", "load data from disk")
@@ -21,7 +21,7 @@ flags.DEFINE_float("beta2", 0.999, "beta2, default 0.999.")
 flags.DEFINE_float("lr", 0.001, "learning rate, default 0.001.")
 flags.DEFINE_string("amie", "./fb15k_amie_rules.csv", "AMIE rule file, only contains Rule,Confidence,PCA.Confidence.")
 flags.DEFINE_float("pca", 1.0, "PCA confidence threshold, default 1.0.")
-flags.DEFINE_float("confidence", 0.8, "confidence threshold, default 0.8.")
+flags.DEFINE_float("confidence", 0.7, "confidence threshold, default 0.8.")
 
 FLAGS = flags.FLAGS
 
