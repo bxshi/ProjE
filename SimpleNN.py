@@ -9,10 +9,9 @@ flags = tf.flags
 logging = tf.logging
 
 flags.DEFINE_string("dataset", 'fb15k', "Dataset, [fb15k|wn18]")
-flags.DEFINE_boolean("simple", True, "Use simple projection (weighted plus) or matrix projection.")
 flags.DEFINE_integer("topk", 1, "relation Hits@topk, default 1.")
 flags.DEFINE_integer("ent_topk", 10, "entity Hits@topk, default 10.")
-flags.DEFINE_integer("batch", 500, "mini batch size, default 2500.")
+flags.DEFINE_integer("batch", 500, "mini batch size, default 500.")
 flags.DEFINE_integer('embed', 100, "embedding size, default 100.")
 flags.DEFINE_integer('max_iter', 1000, 'max iteration, default 1000.')
 flags.DEFINE_string("load", "", "load data from disk")
@@ -20,9 +19,18 @@ flags.DEFINE_float("e", 1e-8, "epsilon, default 1e-8.")
 flags.DEFINE_float("beta1", 0.9, "beta1, default 0.9.")
 flags.DEFINE_float("beta2", 0.999, "beta2, default 0.999.")
 flags.DEFINE_float("lr", 0.001, "learning rate, default 0.001.")
+
+# these features are ignored, but you still could try if you want.
 flags.DEFINE_string("amie", "./fb15k_amie_rules.csv", "AMIE rule file, only contains Rule,Confidence,PCA.Confidence.")
 flags.DEFINE_float("pca", 1.0, "PCA confidence threshold, default 1.0.")
 flags.DEFINE_float("confidence", 0.7, "confidence threshold, default 0.8.")
+flags.DEFINE_boolean("association", False, "use amie")
+
+# following are the settings for different designs
+flags.DEFINE_boolean("simple", True, "Use simple projection (weighted plus) or matrix projection.")
+flags.DEFINE_float("entropy_weight", 1.0, "wrong class entropy weight")
+flags.DEFINE_string("activation", "softmax", "activation of output layer, default is softmax. It can be sigmoid.")
+flags.DEFINE_float("sampling", -1.0, "probability that a false class will not be selected.")
 
 FLAGS = flags.FLAGS
 
@@ -97,6 +105,14 @@ class SimpleNN:
             self.__trainable.append(self.__combination_layer)
             self.__trainable.append(self.__bias)
             self.__trainable.append(self.__comb_bias)
+
+    @property
+    def ent_embedding(self):
+        return self.__ent_embeddings
+
+    @property
+    def rel_embedding(self):
+        return self.__rel_embeddings
 
     def __call__(self, inputs, scope=None):
         """Run NN with given inputs. This function will only return the result of this NN,
@@ -184,6 +200,8 @@ def gen_targets(inputs, n_rel, raw_data, rule_map):
     """ Generate [[rel], ...] w.r.t. generated inputs
     """
     targets = np.zeros([len(inputs), n_rel], dtype=np.float32)
+    weights = np.zeros([len(inputs), n_rel], dtype=np.float32)
+    weights[:, :] = FLAGS.entropy_weight
     raw_nominator = np.zeros([len(inputs), n_rel], dtype=np.float32)
     raw_denominator = np.zeros([len(inputs)], dtype=np.float32)
 
@@ -201,6 +219,7 @@ def gen_targets(inputs, n_rel, raw_data, rule_map):
         for rel in raw_data.train['adj'][head][tail]:
             raw_nominator[i][rel] = len(raw_data.hlmap[head][rel].union(raw_data.tlmap[tail][rel]))
             raw_denominator[i] += raw_nominator[i][rel]
+            weights[i][rel] = 1.0
 
             if rel in rule_map:
                 associated_rules = rule_map[rel]
@@ -231,14 +250,23 @@ def gen_targets(inputs, n_rel, raw_data, rule_map):
 
                     raw_denominator[edge_id] += raw_nominator[edge_id][abs(rule)]
                     task_completed += 1
+                    weights[edge_id][abs(rule)] = 1.0
             pass
         except KeyError:
             continue
 
     print task_completed, "tasks are completed."
 
-    for i in range(len(inputs)):
-        targets[i] = raw_nominator[i] / raw_denominator[i]
+    if FLAGS.activation == 'softmax':
+        for i in range(len(inputs)):
+            targets[i] = raw_nominator[i] / raw_denominator[i]
+    elif FLAGS.activation == 'sigmoid':
+        for i in range(len(inputs)):
+            targets[i] = np.minimum(raw_nominator[i], 1)
+
+    else:
+        print "activation is not a valid value, expected softmax|sigmoid, actual", FLAGS.activation
+        exit(-1)
 
     # for i in range(0, len(inputs)):
     #     head, tail = inputs[i]
@@ -253,7 +281,17 @@ def gen_targets(inputs, n_rel, raw_data, rule_map):
     #     except AssertionError:
     #         raise AssertionError("expect " + str(1.) + " actual " + str(test_sum))
 
-    return np.asarray(targets)
+    return np.asarray(targets), np.asarray(weights)
+
+
+def gen_weights(targets):
+    weights = np.zeros([len(targets), len(targets[0])], dtype=np.float32)
+
+    for i in range(len(targets)):
+        for j in range(len(targets[i])):
+            weights[i][j] = 0.5 if targets[i][j] < 0.01 else 1.0
+
+    return weights
 
 
 def gen_filtered_rels(raw_data):
@@ -325,22 +363,35 @@ def run(raw_data):
     """
     model = SimpleNN(FLAGS.embed, raw_data.rel_id_max + 1, raw_data.entity_id_max + 1, simple=FLAGS.simple)
 
-    with tf.device("cpu:0"):
+    with tf.device("/cpu:0"):
         ph_input = tf.placeholder(tf.int32, [None, 2])
         ph_target = tf.placeholder(tf.float32, [None, raw_data.rel_id_max + 1])
-
+        ph_weight = tf.placeholder(tf.float32, [None, raw_data.rel_id_max + 1])
         y = model(ph_input)
 
-        loss = tf.reduce_sum(tf.nn.softmax_cross_entropy_with_logits(y, ph_target))
+        if FLAGS.activation == 'softmax':
+            loss = -tf.reduce_sum(ph_target * tf.log(tf.nn.softmax(y)) * ph_weight)
+        elif FLAGS.activation == 'sigmoid':
+            loss = -tf.reduce_sum(ph_target * tf.log(tf.sigmoid(y)) * ph_weight)
+        else:
+            print "activation is not a valid value, expected softmax|sigmoid, actual", FLAGS.activation
+            exit(-1)
 
         optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.lr, beta1=FLAGS.beta1, beta2=FLAGS.beta2,
                                            epsilon=FLAGS.e)
 
         grads = optimizer.compute_gradients(loss, tf.trainable_variables())
         op_train = optimizer.apply_gradients(grads)
-        op_test = tf.nn.softmax(y)
 
-    return model, ph_input, ph_target, loss, op_train, op_test
+        if FLAGS.activation == 'softmax':
+            op_test = tf.nn.softmax(y)
+        elif FLAGS.activation == 'sigmoid':
+            op_test = tf.sigmoid(y)
+        else:
+            print "activation is not a valid value, expected softmax|sigmoid, actual", FLAGS.activation
+            exit(-1)
+
+    return model, ph_input, ph_target, ph_weight, loss, op_train, op_test
 
 
 def run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails, k=10, max_offset=10):
@@ -356,7 +407,8 @@ def run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails, k=10, 
 
     with tf.device("/cpu:0"):
         ph_rel = tf.placeholder(tf.int32, shape=[1])
-        op_entity_test = tf.reshape(tf.nn.embedding_lookup(tf.transpose(op_test), ph_rel), [1, raw_data.entity_id_max + 1])
+        op_entity_test = tf.reshape(tf.nn.embedding_lookup(tf.transpose(op_test), ph_rel),
+                                    [1, raw_data.entity_id_max + 1])
 
     for (i, path) in enumerate(test_data):
         head, tail, rel = path
@@ -386,18 +438,34 @@ def run_relation_eval(session, ph_input, op_test, raw_data, filtered_rels, k=1, 
     total = 0
     raw_hits = 0
     filtered_hits = 0
+    rank = 0
+    filtered_rank = 0
 
     inputs = raw_data.test['path'][:, 0:2]
     targets = raw_data.test['path'][:, 2]
 
     with tf.device("/cpu:0"):
-        _, top_rels = tf.nn.top_k(op_test, max_offset + k)
+        # _, top_rels = tf.nn.top_k(op_test, max_offset + k)
+        _, top_rels = tf.nn.top_k(op_test, raw_data.rel_id_max + 1)
         top_rels = session.run(top_rels, {ph_input: inputs})
 
     for i in range(len(top_rels)):
         total += 1
         idx = 0
         filtered_idx = 0
+
+        while idx < len(top_rels[i]):
+            if top_rels[i][idx] == targets[i]:
+                rank += idx + 1
+                filtered_rank += filtered_idx + 1
+                break
+            elif top_rels[i][idx] not in filtered_rels[i]:
+                filtered_idx += 1
+            idx += 1
+
+        idx = 0
+        filtered_idx = 0
+
         while filtered_idx < k and idx < len(top_rels[i]):
             if top_rels[i][idx] == targets[i]:
                 filtered_hits += 1
@@ -408,7 +476,8 @@ def run_relation_eval(session, ph_input, op_test, raw_data, filtered_rels, k=1, 
 
         raw_hits += targets[i] in top_rels[i][:k]
 
-    return float(raw_hits) / float(total), float(filtered_hits) / float(total)
+    return float(raw_hits) / float(total), float(filtered_hits) / float(total), float(rank) / float(total), float(
+        filtered_rank) / float(total)
 
 
 def main(_):
@@ -420,19 +489,27 @@ def main(_):
         print "unknown dataset"
         exit(-1)
 
-    model, ph_input, ph_target, loss, op_train, op_test = run(raw_data)
+    model, ph_input, ph_target, ph_weight, loss, op_train, op_test = run(raw_data)
 
     inputs = gen_inputs(raw_data)
-    rule_map = load_amie_rules(raw_data)
-    targets = gen_targets(inputs, raw_data.rel_id_max + 1, raw_data, rule_map)
+    rule_map = load_amie_rules(raw_data) if FLAGS.association else dict()
+    targets, weights = gen_targets(inputs, raw_data.rel_id_max + 1, raw_data, rule_map)
+    # weights = gen_weights(targets)
+    print "start filtered rel"
     filtered_rels, max_rel_offset = gen_filtered_rels(raw_data)
-    filtered_tails, max_ent_offset = gen_filtered_tails(raw_data)
+    print "end filtered rel"
+    # filtered_tails, max_ent_offset = gen_filtered_tails(raw_data)
 
     best_raw_acc = 0.
     best_raw_iter = -1
 
     best_filtered_acc = 0.
     best_filtered_iter = -1
+
+    best_mean_rank = 99999
+    best_mean_rank_iter = -1
+    best_filtered_rank = 99999
+    best_filtered_rank_iter = -1
 
     if FLAGS.batch <= 0:
         FLAGS.batch = len(raw_data.train['path'])
@@ -450,13 +527,21 @@ def main(_):
             np.random.shuffle(new_order)
             inputs = inputs[new_order, :]
             targets = targets[new_order, :]
+            weights = weights[new_order, :]
 
             accu_loss = 0.
 
             start = 0
             while start < len(inputs):
                 end = min(start + FLAGS.batch, len(inputs))
-                l, _ = session.run([loss, op_train], {ph_input: inputs[start:end, :], ph_target: targets[start:end, :]})
+                tmp_weight = weights[start:end, :]
+                if FLAGS.sampling > 0.:
+                    tmp_weight = np.minimum(
+                        tmp_weight + np.random.choice([0, 1], size=[len(tmp_weight), len(tmp_weight[0])], replace=True,
+                                                    p=[1.0 - FLAGS.sampling, FLAGS.sampling]), 1)
+                l, _ = session.run([loss, op_train], {ph_input: inputs[start:end, :],
+                                                      ph_target: targets[start:end, :],
+                                                      ph_weight: tmp_weight})
                 accu_loss += l
                 start = end
 
@@ -464,10 +549,13 @@ def main(_):
 
             print "--- relation prediction ---"
 
-            raw_rel_acc, filtered_rel_acc = run_relation_eval(session, ph_input, op_test, raw_data, filtered_rels, k=FLAGS.topk,
-                                                      max_offset=max_rel_offset)
+            raw_rel_acc, filtered_rel_acc, raw_rank, filtered_rank = run_relation_eval(session, ph_input, op_test,
+                                                                                       raw_data, filtered_rels,
+                                                                                       k=FLAGS.topk,
+                                                                                       max_offset=max_rel_offset)
 
-            print "\n\traw", raw_rel_acc, "\t\tfiltered", filtered_rel_acc, "\n"
+            print "\n\traw", raw_rel_acc, "\t\tfiltered", filtered_rel_acc
+            print "\n\traw", raw_rank, "\t\tfiltered", filtered_rank, "\n"
 
             if raw_rel_acc > best_raw_acc:
                 best_raw_acc = raw_rel_acc
@@ -477,14 +565,34 @@ def main(_):
                 best_filtered_acc = filtered_rel_acc
                 best_filtered_iter = it
 
+                # rel_embeding = session.run(model.rel_embedding)
+                # print "start writing relation embedding to disk..."
+                # with open("./rel_embedding.csv", 'w+') as f_embed:
+                #     for (i, rel_embed) in enumerate(rel_embeding):
+                #         f_embed.write(str(raw_data.id2rel[i]) + ',')
+                #         f_embed.write(",".join([str(x) for x in rel_embed]))
+                #         f_embed.write("\n")
+                # print "write done"
+
+            if raw_rank < best_mean_rank:
+                best_mean_rank = raw_rank
+                best_mean_rank_iter = it
+
+            if filtered_rank < best_filtered_rank:
+                best_filtered_rank = filtered_rank
+                best_filtered_rank_iter = it
+
             print "\tbest\n\traw", best_raw_acc, "(", best_raw_iter, ")", \
-                "\tfiltered", best_filtered_acc, "(", best_filtered_iter, ")\n"
+                "\tfiltered", best_filtered_acc, "(", best_filtered_iter, ")"
+            print "\tbest\n\traw", best_mean_rank, "(", best_mean_rank_iter, ")", \
+                "\tfiltered", best_filtered_rank, "(", best_filtered_rank_iter, ")", "\n"
 
-            print "--- entity (tail) prediction ---"
-
-            raw_ent_acc, filtered_ent_acc = run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails, k=FLAGS.ent_topk, max_offset=max_ent_offset)
-
-            print "\n\traw", raw_ent_acc, "\t\tfiltered", filtered_ent_acc, "\n"
+            # print "--- entity (tail) prediction ---"
+            #
+            # raw_ent_acc, filtered_ent_acc = run_entity_eval(session, ph_input, op_test, raw_data, filtered_tails,
+            #                                                 k=FLAGS.ent_topk, max_offset=max_ent_offset)
+            #
+            # print "\n\traw", raw_ent_acc, "\t\tfiltered", filtered_ent_acc, "\n"
 
             print "--------------------------"
 

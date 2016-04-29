@@ -261,3 +261,53 @@ class MetaPathData(Data):
     @property
     def rel_id_max(self):
         return self._rel_id_max
+
+
+class FactCheckingData(MetaPathData):
+    @staticmethod
+    def _test_path_loader(path, entities):
+        """Load paths with structure `head tail predicate`.
+        :param path: File path
+        :return: A list of lists, each list is a length-3 tuple representing a path.
+                 An adjacent list contains the relations/predicates that connects head and tail
+        """
+        storage = []
+        with open(path) as f:
+            for line in f:
+                head, tail, rel = line.rstrip().split()
+                head = entities[head]
+                tail = entities[tail]
+                storage.append([head, tail, bool(rel)])
+
+        return storage
+
+    def load_data(self, folder="./data/FB15k"):
+        entity_path = os.path.join(folder, "entity.txt")
+        relation_path = os.path.join(folder, "relation.txt")
+        train_path = os.path.join(folder, "train.txt")
+        test_path = os.path.join(folder, "test.txt")
+
+        self._entity_id_min = 0
+        self._entity2id, self._id2entity = Data._id_loader(entity_path)  # ignored
+        self._entity_id_max = len(self.entity2id) - 1
+
+        self._rel_id_min = 0
+        self._rel2id, self._id2rel = Data._id_loader(relation_path)
+        self._rel_id_max = len(self.rel2id) - 1
+
+        train = Data._path_loader(train_path, self.entity2id, self.rel2id)
+        train_adj = Data.gen_adj_list(train)
+
+        test = FactCheckingData._test_path_loader(test_path, self.entity2id)
+        test_adj = Data.gen_adj_list(test)
+
+        self._train = {'path': np.asarray(train), 'adj': train_adj}
+        self._test = {'path': np.asarray(test), 'adj': None}
+
+        #  make sure if someone calls these variables it will cause an error
+        self._max_id = None
+        self._name2id = None
+        self._id2name = None
+
+        self._hlmap, self._tlmap = Data.gen_lmap(self._train['path'])
+        self._hl_test_map, self._tl_test_map = Data.gen_lmap(self._test['path'])
