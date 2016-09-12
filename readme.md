@@ -11,6 +11,8 @@ First, please download the data file from https://github.com/thunlp/KB2E and unz
 
 You can call `ProjE` using
 
+```bash
 ./ProjE_softmax.py --dim 200 --batch 200 --data ./data/FB15k/ --eval_per 1 --worker 3 --eval_batch 500 --max_iter 100 --generator 10
+```
 
 
