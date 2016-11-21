@@ -1,6 +1,8 @@
 ## ProjE
 
-Embedding Projection for Knowledge Graph Completion
+ProjE: Embedding Projection for Knowledge Graph Completion
+
+Accepted at AAAI'2017.
 
 ---
 
