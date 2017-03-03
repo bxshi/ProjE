@@ -73,7 +73,7 @@ class ProjE:
         start = 0
         while start < n_triple:
             end = min(start + batch_size, n_triple)
-            yield self.__test_triple[start:end, :]
+            yield self.__valid_triple[start:end, :]
             start = end
 
     def corrupted_training(self, htr):
